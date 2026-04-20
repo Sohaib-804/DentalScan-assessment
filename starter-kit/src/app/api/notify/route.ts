@@ -1,23 +1,14 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { DEFAULT_PATIENT_ID } from "@/lib/notify-constants";
+import { enqueueScanNotification } from "@/lib/scan-notification-queue";
 
 /**
  * CHALLENGE: NOTIFICATION SYSTEM
- * 
- * Your goal is to implement a robust notification logic.
- * 1. When a scan is "completed", create a record in the Notification table.
- * 2. Return a success status to the client.
- * 3. Bonus: Handle potential errors (e.g., database connection issues).
+ *
+ * Scan + thread are persisted in a Prisma transaction and returned immediately.
+ * Clinic `Notification` rows are created asynchronously via BullMQ + Redis (see `npm run worker`).
  */
-
-/** Stable demo clinic user for `Notification.userId` — must not use `crypto.randomUUID()` (value would change every server boot).
- * This decision was made to allow for better testing/development purposes. 
- * Real-world scenario would use dynamic values that are fetched and updated accordingly.
- */
-
-
-/** Default patient when the client does not send `userId` (no auth in this demo). */
-const DEMO_PATIENT_USER_ID = "22222222-2222-4222-8222-222222222222";
 
 function normalizeImagesField(images: unknown): string {
   if (Array.isArray(images)) {
@@ -36,19 +27,19 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
 
-    const { scanId, status, images, userId } = body as {
+    const { scanId, status, images, patientId } = body as {
       scanId?: string;
       status?: string;
       images?: string | string[];
-      userId?: string;
+      patientId?: string;
     };
 
-    const patientUserId =
-      typeof userId === "string" && userId.trim() !== "" ? userId.trim() : DEMO_PATIENT_USER_ID;
+    const resolvedPatientId =
+      typeof patientId === "string" && patientId.trim() !== "" ? patientId.trim() : DEFAULT_PATIENT_ID;
 
     if (status !== "completed") {
       return NextResponse.json(
-        { ok: false, error: "Only status \"completed\" triggers notifications" },
+        { ok: false, error: 'Only status "completed" triggers notifications' },
         { status: 400 },
       );
     }
@@ -69,7 +60,7 @@ export async function POST(req: Request) {
         scan = await tx.scan.update({
           where: { id: scanId },
           data: {
-            userId: patientUserId,
+            patientId: resolvedPatientId,
             status: "completed",
             ...(imagesField !== "" ? { images: imagesField } : {}),
           },
@@ -77,7 +68,7 @@ export async function POST(req: Request) {
       } else {
         scan = await tx.scan.create({
           data: {
-            userId: patientUserId,
+            patientId: resolvedPatientId,
             status: "completed",
             images: imagesField,
           },
@@ -85,33 +76,37 @@ export async function POST(req: Request) {
       }
 
       let thread = await tx.thread.findFirst({
-        where: { patientId: scan.id },
+        where: { scanId: scan.id },
       });
       if (!thread) {
         thread = await tx.thread.create({
-          data: { patientId: scan.id },
+          data: { scanId: scan.id },
         });
       }
 
-      const notification = await tx.notification.create({
-        data: {
-          userId: DEMO_PATIENT_USER_ID,
-          title: "Scan completed",
-          message: `A patient finished scan ${scan.id}. Open telehealth to review.`,
-          read: false,
-        },
-      });
-
-      return { scan, notification, thread };
+      return { scan, thread };
     });
+
+    let notificationQueued = false;
+    let queueWarning: string | null = null;
+    try {
+      await enqueueScanNotification(result.scan.id);
+      notificationQueued = true;
+    } catch (queueErr) {
+      console.error("Failed to enqueue scan notification job:", queueErr);
+      queueWarning =
+        "Scan saved but clinic notification could not be queued. Is Redis running and is the worker started?";
+    }
 
     return NextResponse.json({
       ok: true,
       scanId: result.scan.id,
       threadId: result.thread.id,
-      notificationId: result.notification.id,
-      read: result.notification.read,
-      message: "Notification recorded",
+      notificationQueued,
+      ...(queueWarning ? { warning: queueWarning } : {}),
+      message: notificationQueued
+        ? "Scan saved; clinic notification queued"
+        : "Scan saved; notification queue unavailable",
     });
   } catch (err) {
     console.error("Notification API Error:", err);

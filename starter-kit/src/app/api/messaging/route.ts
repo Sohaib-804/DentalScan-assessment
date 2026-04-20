@@ -35,7 +35,7 @@ export async function GET(req: Request) {
 
     return NextResponse.json({
       threadId: thread.id,
-      patientId: thread.patientId,
+      scanId: thread.scanId,
       messages,
     });
   } catch (err) {

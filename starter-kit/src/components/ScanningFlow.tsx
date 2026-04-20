@@ -3,9 +3,7 @@
 import React, { useState, useRef, useCallback, useEffect } from "react";
 import { Camera, CheckCircle2 } from "lucide-react";
 import QuickMessageSidebar from "@/components/QuickMessageSidebar";
-
-/** Must match `DEMO_PATIENT_USER_ID` in `src/app/api/notify/route.ts` when the client omits `userId`. */
-const DEMO_PATIENT_USER_ID = "22222222-2222-4222-8222-222222222222";
+import { DEFAULT_PATIENT_ID } from "@/lib/notify-constants";
 
 type FaceApiLike = {
   nets: {
@@ -118,6 +116,7 @@ export default function ScanningFlow() {
   const notifySentRef = useRef(false);
   const [notifyStatus, setNotifyStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [notifyError, setNotifyError] = useState<string | null>(null);
+  const [notifyWarning, setNotifyWarning] = useState<string | null>(null);
   const [savedScanId, setSavedScanId] = useState<string | null>(null);
   const [savedThreadId, setSavedThreadId] = useState<string | null>(null);
 
@@ -149,6 +148,7 @@ export default function ScanningFlow() {
     notifySentRef.current = true;
     setNotifyStatus("loading");
     setNotifyError(null);
+    setNotifyWarning(null);
 
     const imagesPayload = capturedImages.join(",");
     void (async () => {
@@ -159,7 +159,7 @@ export default function ScanningFlow() {
           body: JSON.stringify({
             status: "completed",
             images: imagesPayload,
-            userId: DEMO_PATIENT_USER_ID,
+            patientId: DEFAULT_PATIENT_ID,
           }),
         });
         const data = (await res.json().catch(() => ({}))) as {
@@ -167,12 +167,14 @@ export default function ScanningFlow() {
           scanId?: string;
           threadId?: string;
           error?: string;
+          warning?: string;
         };
         if (!res.ok || !data.ok) {
           throw new Error(data.error || `Request failed (${res.status})`);
         }
         setSavedScanId(data.scanId ?? null);
         setSavedThreadId(data.threadId ?? null);
+        setNotifyWarning(typeof data.warning === "string" ? data.warning : null);
         setNotifyStatus("done");
       } catch (e) {
         notifySentRef.current = false;
@@ -699,10 +701,18 @@ export default function ScanningFlow() {
                 <p className="text-zinc-400 mt-2">Saving scan and notifying clinic...</p>
               )}
               {notifyStatus === "done" && (
-                <p className="text-zinc-400 mt-2">
-                  Results saved. The clinic has been notified
-                  {savedScanId ? ` (scan ${savedScanId.slice(0, 10)}…)` : ""}.
-                </p>
+                <div className="mt-2 space-y-2">
+                  <p className="text-zinc-400">
+                    Results saved
+                    {notifyWarning
+                      ? "."
+                      : ". A clinic notification was queued"}
+                    {savedScanId ? ` Scan ${savedScanId.slice(0, 10)}…` : ""}.
+                  </p>
+                  {notifyWarning && (
+                    <p className="text-xs text-amber-300/95 max-w-sm mx-auto">{notifyWarning}</p>
+                  )}
+                </div>
               )}
               {notifyStatus === "error" && (
                 <p className="text-rose-400 mt-2 text-sm">

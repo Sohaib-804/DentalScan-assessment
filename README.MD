@@ -35,9 +35,14 @@ This document captures the main technical and product choices made while impleme
 ## 2. Notifications (Task 2)
 
 ### Persistence model
-- On scan completion, **`POST /api/notify`** runs a **Prisma `$transaction`**: update or create **`Scan`** (with required **`userId`** — body `userId` or demo default), **find-or-create `Thread`** keyed by **`Thread.patientId = scan.id`**, then insert **`Notification`** with **`read: false`** for unread tracking.
-- Response includes **`threadId`** so the client can open messaging without `scanId`-based thread discovery.
-- **`CLINIC_USER_ID`** is a **fixed UUID-shaped constant** (not `crypto.randomUUID()` at module load), so every notification targets the same demo clinic user across server restarts.
+- On scan completion, **`POST /api/notify`** runs a **Prisma `$transaction`** for **only** **`Scan`** (with **`Scan.patientId`** — body **`patientId`** or **`DEFAULT_PATIENT_ID`** in **`notify-constants.ts`**) and **find-or-create `Thread`** keyed by **`Thread.scanId = scan.id`**. The handler returns **`scanId`** and **`threadId`** as soon as that transaction commits.
+- **`Notification`** rows for the clinic are **not** written in that transaction. A **BullMQ** job (`scan-notification` queue) is **enqueued** after the transaction; a separate **worker** process (`npm run worker`) consumes the job and calls **`prisma.notification.create`** with **`read: false`** and **`userId: CLINIC_USER_ID`** (fixed UUID in **`starter-kit/src/lib/notify-constants.ts`**, not `crypto.randomUUID()` per boot).
+- If Redis or enqueue fails, the API still returns **`ok: true`** with **`notificationQueued: false`** and a **`warning`** string so the scan/thread are usable while ops can fix the queue.
+
+### Redis & worker (local)
+- **`starter-kit/docker-compose.yml`** runs **Redis 7** on port **6379** (`docker compose up -d` from **`starter-kit/`**).
+- Set **`REDIS_URL`** (see **`.env.example`**) if not using the default **`redis://127.0.0.1:6379`**.
+- Run **`npm run worker`** alongside **`npm run dev`** so notifications are persisted.
 
 ### Prisma in Next.js
 - Shared **`starter-kit/src/lib/prisma.ts`** singleton to avoid connection proliferation during dev hot reload.
@@ -45,8 +50,8 @@ This document captures the main technical and product choices made while impleme
 ### Client trigger
 - After five successful captures, **`ScanningFlow`** calls **`/api/notify`** once (guarded with a ref to avoid duplicate sends under React Strict Mode).
 
-### Async semantics (not “fire-and-forget HTTP”)
-- The **HTTP handler awaits** the DB transaction before responding so the client gets a definitive success/failure and the DB stays consistent. The UI still shows an explicit loading state while waiting.
+### Async semantics
+- The **HTTP response** waits for **scan + thread** persistence only, not for the **`Notification`** insert. Enqueue is **awaited** but is a **fast Redis round-trip**, so the client is not blocked on heavy DB work for the notification row. Large **`images`** payloads still dominate request latency.
 
 ---
 
@@ -54,7 +59,7 @@ This document captures the main technical and product choices made while impleme
 
 ### Data model mapping
 - **`GET /api/messaging`** loads **`Message`** rows with **`findMany({ where: { threadId } })`**. **`Message`** stores **`threadId`** as a **scalar** (no Prisma `@relation` to **`Thread`**) so there is no bidirectional Thread ↔ Message model coupling; integrity is enforced in application / API code.
-- **`Thread.patientId`** is the **scan id** (one thread per completed scan), created in the same transaction as notify.
+- **`Thread.scanId`** is the **completed scan’s id** (one thread per scan), created in the same transaction as notify.
 - The UI receives **`threadId`** from **`POST /api/notify`** and passes it to **`GET /api/messaging?threadId=…`** / **`POST /api/messaging`** with **`threadId`**.
 
 ### API behavior
@@ -77,5 +82,7 @@ This document captures the main technical and product choices made while impleme
 
 ## 5. Operational notes
 
-- From **`starter-kit/`**: `npm install`, `npx prisma db push`, `npm run dev`.
+- From **`starter-kit/`**: `npm install`, `npx prisma db push`, `docker compose up -d` (Redis), then run **`npm run dev`** and **`npm run worker`** in two terminals.
+- Copy **`.env.example`** to **`.env.local`** if you need a non-default **`REDIS_URL`**.
 - After schema changes, run **`npx prisma generate`** (or rely on `npm run build` / dev which regenerates as needed).
+- Renaming **`Scan.userId` → `patientId`** and **`Thread.patientId` → `scanId`** cannot auto-migrate existing SQLite rows with **`db push`** alone; for local dev you can run **`npx prisma db push --force-reset`** (wipes data) or apply an **`ALTER TABLE … RENAME COLUMN`** migration yourself if you must keep rows.

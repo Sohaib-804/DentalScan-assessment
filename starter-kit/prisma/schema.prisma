@@ -8,10 +8,10 @@ datasource db {
 }
 
 model Scan {
-  id        String   @id @default(uuid())
-  userId    String
-  status    String   @default("pending") // pending, completed, failed
-  images    String   @default("") // Comma-separated list of image URLs (SQLite doesn't support scalar lists)
+  id         String   @id @default(uuid())
+  patientId  String
+  status     String   @default("pending") // pending, completed, failed
+  images     String   @default("") // Comma-separated list of image URLs (SQLite doesn't support scalar lists)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
@@ -25,9 +25,10 @@ model Notification {
   createdAt DateTime @default(now())
 }
 
+// Thread.scanId references Scan.id (one thread per completed scan).
 model Thread {
   id        String   @id @default(uuid())
-  patientId String
+  scanId    String
   updatedAt DateTime @updatedAt
 }
 
