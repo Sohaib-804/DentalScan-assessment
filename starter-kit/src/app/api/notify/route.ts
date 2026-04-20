@@ -15,7 +15,9 @@ import { prisma } from "@/lib/prisma";
  * Real-world scenario would use dynamic values that are fetched and updated accordingly.
  */
 
-const CLINIC_USER_ID = "11111111-1111-4111-8111-111111111111";
+
+/** Default patient when the client does not send `userId` (no auth in this demo). */
+const DEMO_PATIENT_USER_ID = "22222222-2222-4222-8222-222222222222";
 
 function normalizeImagesField(images: unknown): string {
   if (Array.isArray(images)) {
@@ -34,11 +36,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
     }
 
-    const { scanId, status, images } = body as {
+    const { scanId, status, images, userId } = body as {
       scanId?: string;
       status?: string;
       images?: string | string[];
+      userId?: string;
     };
+
+    const patientUserId =
+      typeof userId === "string" && userId.trim() !== "" ? userId.trim() : DEMO_PATIENT_USER_ID;
 
     if (status !== "completed") {
       return NextResponse.json(
@@ -63,6 +69,7 @@ export async function POST(req: Request) {
         scan = await tx.scan.update({
           where: { id: scanId },
           data: {
+            userId: patientUserId,
             status: "completed",
             ...(imagesField !== "" ? { images: imagesField } : {}),
           },
@@ -70,27 +77,38 @@ export async function POST(req: Request) {
       } else {
         scan = await tx.scan.create({
           data: {
+            userId: patientUserId,
             status: "completed",
             images: imagesField,
           },
         });
       }
 
+      let thread = await tx.thread.findFirst({
+        where: { patientId: scan.id },
+      });
+      if (!thread) {
+        thread = await tx.thread.create({
+          data: { patientId: scan.id },
+        });
+      }
+
       const notification = await tx.notification.create({
         data: {
-          userId: CLINIC_USER_ID,
+          userId: DEMO_PATIENT_USER_ID,
           title: "Scan completed",
           message: `A patient finished scan ${scan.id}. Open telehealth to review.`,
           read: false,
         },
       });
 
-      return { scan, notification };
+      return { scan, notification, thread };
     });
 
     return NextResponse.json({
       ok: true,
       scanId: result.scan.id,
+      threadId: result.thread.id,
       notificationId: result.notification.id,
       read: result.notification.read,
       message: "Notification recorded",

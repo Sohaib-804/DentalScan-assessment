@@ -15,45 +15,44 @@ type ApiMessage = {
 type UiMessage = ApiMessage & { pending?: boolean };
 
 type Props = {
-  /** Completed scan id — used as Thread.patientId for this demo flow. */
-  scanId: string;
+  /** Server thread id (created with the completed scan — see POST /api/notify). */
+  threadId: string;
+  /** Optional scan id for UI copy only. */
+  scanId?: string | null;
 };
 
 /**
  * Task 3: post-scan quick messaging (R1).
- * R3: optimistic UI — message appears immediately; on failure the draft is restored
- * and the optimistic row is removed so nothing is silently lost.
+ * Messages are loaded with GET ?threadId=… (not embedded on Thread in Prisma).
+ * R3: optimistic UI — message appears immediately; on failure the draft is restored.
  */
-export default function QuickMessageSidebar({ scanId }: Props) {
-  const [threadId, setThreadId] = useState<string | null>(null);
+export default function QuickMessageSidebar({ threadId, scanId }: Props) {
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState("");
-  const [sender, setSender] = useState<"patient" | "dentist">("patient");
   const [error, setError] = useState<string | null>(null);
 
   const loadMessages = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch(`/api/messaging?scanId=${encodeURIComponent(scanId)}`);
+      const res = await fetch(`/api/messaging?threadId=${encodeURIComponent(threadId)}`);
       const data = (await res.json()) as {
-        threadId?: string | null;
+        threadId?: string;
         messages?: ApiMessage[];
         error?: string;
       };
       if (!res.ok) {
         throw new Error(data.error || `Failed to load (${res.status})`);
       }
-      setThreadId(data.threadId ?? null);
       setMessages((data.messages ?? []).map((m) => ({ ...m, pending: false })));
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not load messages");
     } finally {
       setLoading(false);
     }
-  }, [scanId]);
+  }, [threadId]);
 
   useEffect(() => {
     void loadMessages();
@@ -63,18 +62,16 @@ export default function QuickMessageSidebar({ scanId }: Props) {
     const text = draft.trim();
     if (!text || sending) return;
 
-    const optimisticId = `optimistic:${crypto.randomUUID()}`;
-    const snapSender = sender;
+    const optimisticId = crypto.randomUUID();
     const optimistic: UiMessage = {
       id: optimisticId,
-      threadId: threadId ?? "",
+      threadId,
       content: text,
-      sender: snapSender,
+      sender: "patient",
       createdAt: new Date().toISOString(),
       pending: true,
     };
 
-    // Optimistic append + clear composer (snapshot kept in closure for rollback).
     setMessages((prev) => [...prev, optimistic]);
     setDraft("");
     setSending(true);
@@ -85,9 +82,8 @@ export default function QuickMessageSidebar({ scanId }: Props) {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...(threadId ? { threadId } : { scanId }),
+          threadId,
           content: text,
-          sender: snapSender,
         }),
       });
       const data = (await res.json()) as {
@@ -99,7 +95,6 @@ export default function QuickMessageSidebar({ scanId }: Props) {
       if (!res.ok || !data.ok || !data.message) {
         throw new Error(data.error || `Send failed (${res.status})`);
       }
-      setThreadId(data.threadId ?? null);
       setMessages((prev) =>
         prev.map((m) => (m.id === optimisticId ? { ...data.message!, pending: false } : m)),
       );
@@ -119,7 +114,8 @@ export default function QuickMessageSidebar({ scanId }: Props) {
         <div className="min-w-0 flex-1">
           <p className="text-sm font-semibold text-white">Message clinic</p>
           <p className="text-[10px] text-zinc-500 truncate">
-            Same screen as your results — no extra app (R1)
+            Thread {threadId.slice(0, 8)}…
+            {scanId ? ` · scan ${scanId.slice(0, 8)}…` : ""}
           </p>
         </div>
         {!loading && (
@@ -151,7 +147,7 @@ export default function QuickMessageSidebar({ scanId }: Props) {
         )}
         {!loading && messages.length === 0 && !error && (
           <p className="text-xs text-zinc-500">
-            No messages yet. Send a note to your clinic — they will see it linked to this scan.
+            No messages yet. Send a note to your clinic — they will see it on this thread.
           </p>
         )}
         {messages.map((m) => (
@@ -163,7 +159,7 @@ export default function QuickMessageSidebar({ scanId }: Props) {
                 : "mr-auto bg-zinc-800 text-zinc-100 border border-zinc-700"
             } ${m.pending ? "opacity-80 border-dashed" : ""}`}
           >
-            <span className="block text-[10px] uppercase tracking-wide text-zinc-400 mb-0.5">
+            <span className="mb-0.5 block text-[10px] uppercase tracking-wide text-zinc-400">
               {m.sender === "patient" ? "You" : "Clinic"}
               {m.pending ? " · sending…" : ""}
             </span>
@@ -179,21 +175,9 @@ export default function QuickMessageSidebar({ scanId }: Props) {
       )}
 
       <div className="shrink-0 space-y-2 border-t border-zinc-800 bg-zinc-950 p-2">
-        <label className="block text-[10px] text-zinc-500 uppercase tracking-wide">
-          Send as
-          <select
-            className="mt-1 w-full rounded bg-zinc-900 border border-zinc-700 text-xs text-white px-2 py-1"
-            value={sender}
-            onChange={(e) => setSender(e.target.value as "patient" | "dentist")}
-            disabled={sending}
-          >
-            <option value="patient">Patient</option>
-            <option value="dentist">Clinic (demo)</option>
-          </select>
-        </label>
         <textarea
           rows={2}
-          className="w-full rounded bg-zinc-900 border border-zinc-700 text-xs text-white px-2 py-1.5 resize-none placeholder:text-zinc-600 disabled:opacity-50"
+          className="w-full resize-none rounded border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs text-white placeholder:text-zinc-600 disabled:opacity-50"
           placeholder="Type a quick message…"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
@@ -209,7 +193,7 @@ export default function QuickMessageSidebar({ scanId }: Props) {
           type="button"
           onClick={() => void handleSend()}
           disabled={sending || !draft.trim()}
-          className="w-full flex items-center justify-center gap-2 rounded bg-blue-600 hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-medium py-2"
+          className="flex w-full items-center justify-center gap-2 rounded bg-blue-600 py-2 text-xs font-medium text-white hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           <Send size={14} />
           {sending ? "Sending…" : "Send"}

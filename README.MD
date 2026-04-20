@@ -27,12 +27,16 @@ This document captures the main technical and product choices made while impleme
 ### Capture lock
 - User **cannot capture** until automated checks pass (centering, distance, direction where applicable, mouth openness on upper/lower). Messaging stresses **manual tap to capture** so users do not expect auto-shutter.
 
+### Tuning detection strictness
+- Adjust the **`FACE_TUNING`** object near the top of **`starter-kit/src/components/ScanningFlow.tsx`** (single place). Comments in that block describe each ratio; **increase** `maxCenterOffsetX` / `maxCenterOffsetY` or **decrease** `mouthOpenPassThreshold` / `targetMouthOpenUpperLower` to make capture easier.
+
 ---
 
 ## 2. Notifications (Task 2)
 
 ### Persistence model
-- On scan completion, **`POST /api/notify`** runs a **Prisma `$transaction`**: update or create **`Scan`**, then insert **`Notification`** with **`read: false`** for unread tracking.
+- On scan completion, **`POST /api/notify`** runs a **Prisma `$transaction`**: update or create **`Scan`** (with required **`userId`** — body `userId` or demo default), **find-or-create `Thread`** keyed by **`Thread.patientId = scan.id`**, then insert **`Notification`** with **`read: false`** for unread tracking.
+- Response includes **`threadId`** so the client can open messaging without `scanId`-based thread discovery.
 - **`CLINIC_USER_ID`** is a **fixed UUID-shaped constant** (not `crypto.randomUUID()` at module load), so every notification targets the same demo clinic user across server restarts.
 
 ### Prisma in Next.js
@@ -49,12 +53,13 @@ This document captures the main technical and product choices made while impleme
 ## 3. Patient–clinic messaging (Task 3)
 
 ### Data model mapping
-- **`Thread.patientId`** is set to the **completed scan id** so the client can load history with **`GET /api/messaging?scanId=…`** before it knows a `threadId`.
-- **`POST /api/messaging`** accepts **`threadId` or `scanId`**; with only `scanId`, the server **finds or creates** the thread then inserts **`Message`**.
+- **`GET /api/messaging`** loads **`Message`** rows with **`findMany({ where: { threadId } })`**. **`Message`** stores **`threadId`** as a **scalar** (no Prisma `@relation` to **`Thread`**) so there is no bidirectional Thread ↔ Message model coupling; integrity is enforced in application / API code.
+- **`Thread.patientId`** is the **scan id** (one thread per completed scan), created in the same transaction as notify.
+- The UI receives **`threadId`** from **`POST /api/notify`** and passes it to **`GET /api/messaging?threadId=…`** / **`POST /api/messaging`** with **`threadId`**.
 
 ### API behavior
-- **GET:** `threadId` **or** `scanId` (trimmed); appropriate **400 / 404** responses.
-- **POST:** validates **`sender`** ∈ `{ patient, dentist }`, trims ids, uses **transaction** for create-thread + insert-message when needed.
+- **GET:** requires **`threadId`**; loads **`Thread`** then **`message.findMany({ where: { threadId } })`** — **400** if missing, **404** if thread absent.
+- **POST:** requires **`threadId`** and **`content`**; verifies thread exists, creates **`Message`** with **`sender: "patient"`** only (no clinic send from this UI), bumps **`Thread.updatedAt`**.
 
 ### UI / state
 - **`QuickMessageSidebar`** on the **same post-scan screen** as results (no extra navigation).

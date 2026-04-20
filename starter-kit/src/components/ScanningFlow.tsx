@@ -4,6 +4,9 @@ import React, { useState, useRef, useCallback, useEffect } from "react";
 import { Camera, CheckCircle2 } from "lucide-react";
 import QuickMessageSidebar from "@/components/QuickMessageSidebar";
 
+/** Must match `DEMO_PATIENT_USER_ID` in `src/app/api/notify/route.ts` when the client omits `userId`. */
+const DEMO_PATIENT_USER_ID = "22222222-2222-4222-8222-222222222222";
+
 type FaceApiLike = {
   nets: {
     tinyFaceDetector: {
@@ -34,6 +37,51 @@ type FaceApiLike = {
     >;
   };
 };
+
+/**
+ * Face / mouth gate — tweak these to change strictness (higher center limits = looser;
+ * lower mouthOpenPassThreshold = easier capture on upper/lower steps).
+ */
+const FACE_TUNING = {
+  maxCenterOffsetX: 0.28,
+  maxCenterOffsetY: 0.32,
+  /** Lower = user can sit farther back while still passing distance checks (matches smaller on-screen oval). */
+  minFaceHeightRatio: 0.24,
+  maxFaceHeightRatio: 0.92,
+  /** Left view: displayed yaw must be below this (more negative = turned further left). Nearer 0 = looser. */
+  leftTurnYawMax: -0.006,
+  /** Right view: displayed yaw must be above this. Nearer 0 = looser. */
+  rightTurnYawMin: 0.006,
+  targetMouthOpenUpperLower: 0.34,
+  targetMouthOpenNeutral: 0.17,
+  /** Upper/lower steps: openness progress (0–1) needed before capture. Lower = easier. */
+  mouthOpenPassThreshold: 0.52,
+  tiltGuidanceOpenness: 0.55,
+  /** When |offset| exceeds this, show “move left/right” hints before failing center check. */
+  centerNudgeThreshold: 0.1,
+  mouthGuideColorHigh: 0.68,
+  mouthGuideColorMid: 0.32,
+} as const;
+
+const VIEWS = [
+  { label: "Front View", instruction: "Smile and look straight at the camera." },
+  { label: "Left View", instruction: "Turn your head to the left." },
+  { label: "Right View", instruction: "Turn your head to the right." },
+  { label: "Upper Teeth", instruction: "Tilt your head back and open wide." },
+  { label: "Lower Teeth", instruction: "Tilt your head down and open wide." },
+] as const;
+
+/** Stable key so mouth overlay state skips React updates when landmarks barely jitter. */
+function mouthGuideKey(m: {
+  leftPercent: number;
+  topPercent: number;
+  width: number;
+  height: number;
+  roundnessPercent: number;
+  colorClass: string;
+}) {
+  return `${m.leftPercent.toFixed(1)}|${m.topPercent.toFixed(1)}|${Math.round(m.width)}|${Math.round(m.height)}|${m.roundnessPercent}|${m.colorClass}`;
+}
 
 /**
  * CHALLENGE: SCAN ENHANCEMENT
@@ -71,14 +119,7 @@ export default function ScanningFlow() {
   const [notifyStatus, setNotifyStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
   const [notifyError, setNotifyError] = useState<string | null>(null);
   const [savedScanId, setSavedScanId] = useState<string | null>(null);
-
-  const VIEWS = [
-    { label: "Front View", instruction: "Smile and look straight at the camera." },
-    { label: "Left View", instruction: "Turn your head to the left." },
-    { label: "Right View", instruction: "Turn your head to the right." },
-    { label: "Upper Teeth", instruction: "Tilt your head back and open wide." },
-    { label: "Lower Teeth", instruction: "Tilt your head down and open wide." },
-  ];
+  const [savedThreadId, setSavedThreadId] = useState<string | null>(null);
 
   // Initialize Camera
   useEffect(() => {
@@ -118,17 +159,20 @@ export default function ScanningFlow() {
           body: JSON.stringify({
             status: "completed",
             images: imagesPayload,
+            userId: DEMO_PATIENT_USER_ID,
           }),
         });
         const data = (await res.json().catch(() => ({}))) as {
           ok?: boolean;
           scanId?: string;
+          threadId?: string;
           error?: string;
         };
         if (!res.ok || !data.ok) {
           throw new Error(data.error || `Request failed (${res.status})`);
         }
         setSavedScanId(data.scanId ?? null);
+        setSavedThreadId(data.threadId ?? null);
         setNotifyStatus("done");
       } catch (e) {
         notifySentRef.current = false;
@@ -142,6 +186,50 @@ export default function ScanningFlow() {
     if (currentStep >= VIEWS.length) return;
 
     let disposed = false;
+    const lastEmitted = {
+      quality: null as "aligning" | "hold-steady" | "ready" | null,
+      guidance: null as string | null,
+      mouthKey: null as string | null,
+    };
+    const emitDetectionUi = (patch: {
+      quality?: "aligning" | "hold-steady" | "ready";
+      guidance?: string;
+      mouth?: {
+        leftPercent: number;
+        topPercent: number;
+        width: number;
+        height: number;
+        roundnessPercent: number;
+        colorClass: string;
+      };
+    }) => {
+      if (patch.mouth) {
+        const mk = mouthGuideKey(patch.mouth);
+        if (lastEmitted.mouthKey !== mk) {
+          lastEmitted.mouthKey = mk;
+          setMouthGuide(patch.mouth);
+        }
+      }
+      if (patch.quality !== undefined && patch.guidance !== undefined) {
+        if (lastEmitted.quality !== patch.quality || lastEmitted.guidance !== patch.guidance) {
+          lastEmitted.quality = patch.quality;
+          lastEmitted.guidance = patch.guidance;
+          setQualityState(patch.quality);
+          setGuidanceMessage(patch.guidance);
+        }
+      } else if (patch.quality !== undefined) {
+        if (lastEmitted.quality !== patch.quality) {
+          lastEmitted.quality = patch.quality;
+          setQualityState(patch.quality);
+        }
+      } else if (patch.guidance !== undefined) {
+        if (lastEmitted.guidance !== patch.guidance) {
+          lastEmitted.guidance = patch.guidance;
+          setGuidanceMessage(patch.guidance);
+        }
+      }
+    };
+
     const FaceDetectorConstructor = (
       window as Window & { FaceDetector?: new (options?: { fastMode?: boolean; maxDetectedFaces?: number }) => { detect: (source: CanvasImageSource) => Promise<Array<{ boundingBox: DOMRectReadOnly }>> } }
     ).FaceDetector;
@@ -213,7 +301,7 @@ export default function ScanningFlow() {
         console.error("Unable to initialize face detection fallback", err);
         detectorModeRef.current = "none";
         setDetectorSupported(false);
-        setQualityState("aligning");
+        emitDetectionUi({ quality: "aligning" });
         return false;
       }
     };
@@ -222,8 +310,7 @@ export default function ScanningFlow() {
       if (disposed) return;
       const video = videoRef.current;
       if (!video || video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
-        setQualityState("aligning");
-        setGuidanceMessage("Preparing camera feed...");
+        emitDetectionUi({ quality: "aligning", guidance: "Preparing camera feed..." });
         return;
       }
 
@@ -255,8 +342,7 @@ export default function ScanningFlow() {
         }
 
         if (!box) {
-          setQualityState("aligning");
-          setGuidanceMessage("Move your face into the oval");
+          emitDetectionUi({ quality: "aligning", guidance: "Move your face into the oval" });
           return;
         }
 
@@ -269,10 +355,13 @@ export default function ScanningFlow() {
         const centerOffsetY = Math.abs(centerY - video.videoHeight / 2) / (video.videoHeight / 2);
         const faceHeightRatio = height / video.videoHeight;
 
-        const centered = centerOffsetX <= 0.18 && centerOffsetY <= 0.22;
-        const distanceGood = faceHeightRatio >= 0.42 && faceHeightRatio <= 0.8;
-        const tooFar = faceHeightRatio < 0.42;
-        const tooClose = faceHeightRatio > 0.8;
+        const centered =
+          centerOffsetX <= FACE_TUNING.maxCenterOffsetX && centerOffsetY <= FACE_TUNING.maxCenterOffsetY;
+        const distanceGood =
+          faceHeightRatio >= FACE_TUNING.minFaceHeightRatio &&
+          faceHeightRatio <= FACE_TUNING.maxFaceHeightRatio;
+        const tooFar = faceHeightRatio < FACE_TUNING.minFaceHeightRatio;
+        const tooClose = faceHeightRatio > FACE_TUNING.maxFaceHeightRatio;
         const needsUpperTilt = currentStep === 3;
         const needsLowerTilt = currentStep === 4;
 
@@ -292,8 +381,8 @@ export default function ScanningFlow() {
 
         const targetMouthOpenRatio =
           currentStep === 3 || currentStep === 4
-            ? 0.42
-            : 0.2;
+            ? FACE_TUNING.targetMouthOpenUpperLower
+            : FACE_TUNING.targetMouthOpenNeutral;
         const opennessProgress =
           currentStep === 3 || currentStep === 4
             ? Math.max(0, Math.min(1, mouthOpenRatio / targetMouthOpenRatio))
@@ -305,28 +394,32 @@ export default function ScanningFlow() {
                 ),
               );
         const mouthColorClass =
-          opennessProgress >= 0.75
+          opennessProgress >= FACE_TUNING.mouthGuideColorHigh
             ? "border-emerald-400/85"
-            : opennessProgress >= 0.45
+            : opennessProgress >= FACE_TUNING.mouthGuideColorMid
               ? "border-amber-300/85"
               : "border-rose-300/80";
         const mouthRoundnessPercent = Math.round(999 - opennessProgress * 949);
         const mouthWidthScale = currentStep >= 3 ? 1.85 : 1.5;
         const mouthHeightScale = currentStep >= 3 ? 1.15 + opennessProgress * 1.15 : 0.72 + opennessProgress * 0.35;
 
-        setMouthGuide({
-          leftPercent: Math.max(15, Math.min(85, 100 - (mouthCenterX / video.videoWidth) * 100)),
-          topPercent: Math.max(35, Math.min(82, (mouthCenterY / video.videoHeight) * 100)),
-          width: Math.max(84, Math.min(170, mouthWidth * mouthWidthScale)),
-          height: Math.max(28, Math.min(120, mouthWidth * mouthHeightScale)),
-          roundnessPercent: mouthRoundnessPercent,
-          colorClass: mouthColorClass,
+        emitDetectionUi({
+          mouth: {
+            leftPercent: Math.max(15, Math.min(85, 100 - (mouthCenterX / video.videoWidth) * 100)),
+            topPercent: Math.max(35, Math.min(82, (mouthCenterY / video.videoHeight) * 100)),
+            width: Math.max(84, Math.min(170, mouthWidth * mouthWidthScale)),
+            height: Math.max(28, Math.min(120, mouthWidth * mouthHeightScale)),
+            roundnessPercent: mouthRoundnessPercent,
+            colorClass: mouthColorClass,
+          },
         });
 
         let directionOk = true;
         if ((currentStep === 1 || currentStep === 2) && (!landmarkNose?.length || !landmarkLeftEye?.length || !landmarkRightEye?.length)) {
-          setQualityState("aligning");
-          setGuidanceMessage("Hold still while we detect your head direction");
+          emitDetectionUi({
+            quality: "aligning",
+            guidance: "Hold still while we detect your head direction",
+          });
           return;
         }
         if (currentStep === 1 && landmarkNose?.length && landmarkLeftEye?.length && landmarkRightEye?.length) {
@@ -335,10 +428,12 @@ export default function ScanningFlow() {
           const noseCenterX = landmarkNose.reduce((sum, p) => sum + p.x, 0) / landmarkNose.length;
           const eyeMidX = (leftEyeCenterX + rightEyeCenterX) / 2;
           const yawOffsetDisplayed = -((noseCenterX - eyeMidX) / video.videoWidth);
-          if (yawOffsetDisplayed > -0.015) {
+          if (yawOffsetDisplayed > FACE_TUNING.leftTurnYawMax) {
             directionOk = false;
-            setQualityState("aligning");
-            setGuidanceMessage("Turn your head to your left, then tap Capture");
+            emitDetectionUi({
+              quality: "aligning",
+              guidance: "Turn your head to your left, then tap Capture",
+            });
             return;
           }
         }
@@ -349,69 +444,71 @@ export default function ScanningFlow() {
           const noseCenterX = landmarkNose.reduce((sum, p) => sum + p.x, 0) / landmarkNose.length;
           const eyeMidX = (leftEyeCenterX + rightEyeCenterX) / 2;
           const yawOffsetDisplayed = -((noseCenterX - eyeMidX) / video.videoWidth);
-          if (yawOffsetDisplayed < 0.015) {
+          if (yawOffsetDisplayed < FACE_TUNING.rightTurnYawMin) {
             directionOk = false;
-            setQualityState("aligning");
-            setGuidanceMessage("Turn your head to your right, then tap Capture");
+            emitDetectionUi({
+              quality: "aligning",
+              guidance: "Turn your head to your right, then tap Capture",
+            });
             return;
           }
         }
 
-        const mouthOk = currentStep >= 3 ? Boolean(landmarkMouth?.length) && opennessProgress >= 0.72 : true;
+        const mouthOk =
+          currentStep >= 3
+            ? Boolean(landmarkMouth?.length) && opennessProgress >= FACE_TUNING.mouthOpenPassThreshold
+            : true;
         const allChecksPass = centered && distanceGood && directionOk && mouthOk;
 
         if (allChecksPass) {
-          setQualityState("ready");
-          if (needsUpperTilt) {
-            setGuidanceMessage(opennessProgress >= 0.7 ? "Great. Tilt head back slightly, then tap Capture" : "Open wider, tilt head back, then tap Capture");
-          } else if (needsLowerTilt) {
-            setGuidanceMessage(opennessProgress >= 0.7 ? "Great. Tilt head down slightly, then tap Capture" : "Open wider, tilt head down, then tap Capture");
-          } else {
-            setGuidanceMessage("Ready - tap Capture");
-          }
+          const g = needsUpperTilt
+            ? opennessProgress >= FACE_TUNING.tiltGuidanceOpenness
+              ? "Great. Tilt head back slightly, then tap Capture"
+              : "Open wider, tilt head back, then tap Capture"
+            : needsLowerTilt
+              ? opennessProgress >= FACE_TUNING.tiltGuidanceOpenness
+                ? "Great. Tilt head down slightly, then tap Capture"
+                : "Open wider, tilt head down, then tap Capture"
+              : "Ready - tap Capture";
+          emitDetectionUi({ quality: "ready", guidance: g });
         } else if (centered || distanceGood || (currentStep >= 3 && !mouthOk)) {
-          setQualityState("hold-steady");
-          if (currentStep >= 3 && !mouthOk) {
-            setGuidanceMessage(
-              currentStep === 3
+          const g =
+            currentStep >= 3 && !mouthOk
+              ? currentStep === 3
                 ? "Open your mouth wider and tilt head back, then tap Capture"
-                : "Open your mouth wider and tilt head down, then tap Capture",
-            );
-          } else if (!centered) {
-            if (centerOffsetXDisplayed > 0.06) {
-              setGuidanceMessage("Move slightly left to center your face");
-            } else if (centerOffsetXDisplayed < -0.06) {
-              setGuidanceMessage("Move slightly right to center your face");
-            } else if (centerY < video.videoHeight * 0.5) {
-              setGuidanceMessage("Move slightly down to center your face");
-            } else {
-              setGuidanceMessage("Move slightly up to center your face");
-            }
-          } else if (tooFar) {
-            setGuidanceMessage("Move phone slightly closer to your face");
-          } else if (tooClose) {
-            setGuidanceMessage("Move phone slightly farther from your face");
-          } else {
-            setGuidanceMessage("Adjust position, then tap Capture when ready");
-          }
+                : "Open your mouth wider and tilt head down, then tap Capture"
+              : !centered
+                ? centerOffsetXDisplayed > FACE_TUNING.centerNudgeThreshold
+                  ? "Move slightly left to center your face"
+                  : centerOffsetXDisplayed < -FACE_TUNING.centerNudgeThreshold
+                    ? "Move slightly right to center your face"
+                    : centerY < video.videoHeight * 0.5
+                      ? "Move slightly down to center your face"
+                      : "Move slightly up to center your face"
+                : tooFar
+                  ? "Move phone slightly closer to your face"
+                  : tooClose
+                    ? "Move phone slightly farther from your face"
+                    : "Adjust position, then tap Capture when ready";
+          emitDetectionUi({ quality: "hold-steady", guidance: g });
         } else {
-          setQualityState("aligning");
-          if (tooFar) {
-            setGuidanceMessage("Move closer and center your face in the oval");
-          } else if (tooClose) {
-            setGuidanceMessage("Move slightly farther and center your face in the oval");
-          } else if (centerOffsetXDisplayed > 0.06) {
-            setGuidanceMessage("Move left and center your face in the oval");
-          } else if (centerOffsetXDisplayed < -0.06) {
-            setGuidanceMessage("Move right and center your face in the oval");
-          } else {
-            setGuidanceMessage("Center your face in the oval");
-          }
+          const g = tooFar
+            ? "Move closer and center your face in the oval"
+            : tooClose
+              ? "Move slightly farther and center your face in the oval"
+              : centerOffsetXDisplayed > FACE_TUNING.centerNudgeThreshold
+                ? "Move left and center your face in the oval"
+                : centerOffsetXDisplayed < -FACE_TUNING.centerNudgeThreshold
+                  ? "Move right and center your face in the oval"
+                  : "Center your face in the oval";
+          emitDetectionUi({ quality: "aligning", guidance: g });
         }
       } catch (err) {
         console.error("Face quality detection failed", err);
-        setQualityState("aligning");
-        setGuidanceMessage("Detection paused. Reposition and try again");
+        emitDetectionUi({
+          quality: "aligning",
+          guidance: "Detection paused. Reposition and try again",
+        });
       }
     };
 
@@ -428,7 +525,7 @@ export default function ScanningFlow() {
       disposed = true;
       if (timer) clearInterval(timer);
     };
-  }, [currentStep, VIEWS.length]);
+  }, [currentStep]);
 
   const handleCapture = useCallback(() => {
     // Boilerplate logic for capturing a frame from the video feed
@@ -475,12 +572,14 @@ export default function ScanningFlow() {
           : "min-h-screen"
       }`}
     >
-      {/* Header */}
-      <div className="shrink-0 p-4 w-full bg-zinc-900 border-b border-zinc-800 flex justify-between">
+      {/* Header — step progress lives on the camera overlay */}
+      <div className="shrink-0 mb-3 p-4 w-full bg-zinc-900 border-b border-zinc-800 flex items-center justify-between">
         <h1 className="font-bold text-blue-400">DentalScan AI</h1>
-        <span className="text-xs text-zinc-500">
-          {currentStep >= 5 ? "Done" : `Step ${currentStep + 1}/5`}
-        </span>
+        {currentStep >= 5 ? (
+          <span className="text-xs font-medium uppercase tracking-wider text-emerald-400/90">Complete</span>
+        ) : (
+          <span className="text-[10px] uppercase tracking-wider text-zinc-500">5 guided photos</span>
+        )}
       </div>
 
       {/* Main Viewport — on results dashboard, fills remaining height so sidebar can scroll internally */}
@@ -497,16 +596,76 @@ export default function ScanningFlow() {
               ref={videoRef} 
               autoPlay 
               playsInline 
-              className="w-full h-full object-cover grayscale opacity-80 scale-x-[-1]" 
+              className="w-full h-full object-cover opacity-80 scale-x-[-1]" 
             />
-            
-            <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+
+            {/* Spotlight: clear inside the face guide ellipse, darker outside (matches ~60% × 72% oval). */}
+            <div
+              className="pointer-events-none absolute inset-0 z-[1]"
+              style={{
+                background:
+                  "radial-gradient(ellipse 30% 36% at 50% 50%, transparent 0%, transparent 52%, rgba(0,0,0,0.28) 66%, rgba(0,0,0,0.62) 82%, rgba(0,0,0,0.82) 100%)",
+              }}
+              aria-hidden
+            />
+
+            {/* Progress + status over the feed (replaces plain "Step n/5" in the header) */}
+            <div
+              className="absolute top-0 left-0 right-0 z-10 pointer-events-none flex flex-col items-stretch gap-2 px-4 pt-3 pb-4 bg-gradient-to-b from-black/90 via-black/55 to-transparent"
+              aria-label="Scan progress"
+            >
               <div
-                className={`relative w-[72%] h-[84%] border-2 border-dashed bg-black/10 transition-colors duration-300 ${qualityColorClass} rounded-[46%]`}
+                className="mx-auto flex w-full max-w-[min(100%,18rem)] gap-1"
+                role="progressbar"
+                aria-valuemin={1}
+                aria-valuemax={VIEWS.length}
+                aria-valuenow={currentStep + 1}
+                aria-valuetext={`Photo ${currentStep + 1} of ${VIEWS.length}: ${VIEWS[currentStep].label}`}
+              >
+                {VIEWS.map((v, i) => {
+                  const done = i < currentStep;
+                  const active = i === currentStep;
+                  return (
+                    <div key={v.label} className="min-w-0 flex-1 flex flex-col items-center gap-1">
+                      <div
+                        className={`h-1.5 w-full rounded-full transition-all duration-300 ${
+                          done
+                            ? "bg-emerald-500 shadow-[0_0_12px_rgba(16,185,129,0.35)]"
+                            : active
+                              ? "h-2 bg-blue-500 shadow-[0_0_14px_rgba(59,130,246,0.45)]"
+                              : "bg-zinc-600/35"
+                        }`}
+                      />
+                      <span
+                        className={`text-[9px] font-semibold tabular-nums leading-none ${
+                          done ? "text-emerald-400/90" : active ? "text-blue-300" : "text-zinc-600"
+                        }`}
+                      >
+                        {i + 1}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              <p className="text-center text-[13px] font-semibold tracking-tight text-white drop-shadow-sm">
+                {VIEWS[currentStep].label}
+              </p>
+              <div className="flex justify-center">
+                <div
+                  className={`px-3 py-1.5 rounded-full border text-xs font-semibold tracking-wide bg-black/50 backdrop-blur-md transition-colors duration-300 ${qualityColorClass}`}
+                >
+                  {qualityLabel}
+                </div>
+              </div>
+            </div>
+            
+            <div className="pointer-events-none absolute inset-0 z-[5] flex items-center justify-center">
+              <div
+                className={`relative h-[72%] w-[60%] rounded-[46%] border-[3px] border-dashed bg-transparent shadow-[0_0_0_2px_rgba(0,0,0,0.45),0_0_20px_rgba(0,0,0,0.25)] ring-2 ring-white/20 transition-[color,box-shadow,border-color] duration-300 ${qualityColorClass}`}
               >
                 {/* Mouth guide becomes more prominent for upper/lower capture steps. */}
                 <div
-                  className={`absolute -translate-x-1/2 -translate-y-1/2 border-2 transition-all duration-300 ${isMouthFocusedStep ? "opacity-100" : "opacity-80"} ${mouthGuide.colorClass}`}
+                  className={`absolute -translate-x-1/2 -translate-y-1/2 border-[3px] shadow-[0_0_12px_rgba(0,0,0,0.45)] transition-all duration-300 ${isMouthFocusedStep ? "opacity-100" : "opacity-90"} ${mouthGuide.colorClass}`}
                   style={{
                     left: `${mouthGuide.leftPercent}%`,
                     top: `${mouthGuide.topPercent}%`,
@@ -518,18 +677,17 @@ export default function ScanningFlow() {
               </div>
             </div>
 
-            <div className="absolute top-4 left-1/2 -translate-x-1/2">
-              <div
-                className={`px-3 py-1.5 rounded-full border text-xs font-semibold tracking-wide bg-black/45 backdrop-blur-sm transition-colors duration-300 ${qualityColorClass}`}
-              >
-                {qualityLabel}
-              </div>
-            </div>
-
-            {/* Instruction Overlay */}
-            <div className="absolute bottom-10 left-0 right-0 p-6 bg-gradient-to-t from-black to-transparent text-center">
-              <p className="text-sm font-medium">{VIEWS[currentStep].instruction}</p>
-              <p className="text-xs text-zinc-300 mt-2">{guidanceMessage}</p>
+            {/* Instruction overlay — multi-stop gradient so copy fades smoothly into the video */}
+            <div
+              className="pointer-events-none absolute inset-x-0 bottom-0 z-[15] px-5 pb-10 pt-28 text-center
+                bg-[linear-gradient(to_top,rgb(0,0,0)_0%,rgba(0,0,0,0.92)_12%,rgba(0,0,0,0.72)_28%,rgba(0,0,0,0.4)_48%,rgba(0,0,0,0.12)_72%,transparent_100%)]"
+            >
+              <p className="text-sm font-medium text-white drop-shadow-[0_2px_8px_rgba(0,0,0,0.85)]">
+                {VIEWS[currentStep].instruction}
+              </p>
+              <p className="mt-2 text-xs text-zinc-200 drop-shadow-[0_1px_6px_rgba(0,0,0,0.9)]">
+                {guidanceMessage}
+              </p>
             </div>
           </>
         ) : (
@@ -552,9 +710,9 @@ export default function ScanningFlow() {
                 </p>
               )}
             </div>
-            {notifyStatus === "done" && savedScanId && (
+            {notifyStatus === "done" && savedScanId && savedThreadId && (
               <div className="flex min-h-0 w-full max-h-[min(52dvh,420px)] flex-1 flex-col border-t border-zinc-800 bg-zinc-950 p-3 md:h-full md:max-h-full md:w-[min(100%,320px)] md:flex-none md:shrink-0 md:border-l md:border-t-0 md:p-4">
-                <QuickMessageSidebar scanId={savedScanId} />
+                <QuickMessageSidebar threadId={savedThreadId} scanId={savedScanId} />
               </div>
             )}
           </div>
@@ -578,7 +736,9 @@ export default function ScanningFlow() {
       </div>
 
       {/* Thumbnails */}
-      <div className={`flex shrink-0 gap-2 overflow-x-auto p-4 w-full ${isResultsDashboard ? "max-w-5xl" : ""}`}>
+      <div
+        className={`flex w-full shrink-0 justify-center gap-2 overflow-x-auto p-4 ${isResultsDashboard ? "max-w-5xl" : ""}`}
+      >
         {VIEWS.map((v, i) => (
           <div 
             key={i} 

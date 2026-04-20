@@ -9,6 +9,7 @@ datasource db {
 
 model Scan {
   id        String   @id @default(uuid())
+  userId    String
   status    String   @default("pending") // pending, completed, failed
   images    String   @default("") // Comma-separated list of image URLs (SQLite doesn't support scalar lists)
   createdAt DateTime @default(now())
@@ -25,17 +26,16 @@ model Notification {
 }
 
 model Thread {
-  id        String    @id @default(uuid())
+  id        String   @id @default(uuid())
   patientId String
-  messages  Message[]
-  updatedAt DateTime  @updatedAt
+  updatedAt DateTime @updatedAt
 }
 
+// Message.threadId references Thread.id logically only (no @relation — avoids Thread ↔ Message coupling).
 model Message {
   id        String   @id @default(uuid())
   threadId  String
   content   String
   sender    String   // patient, dentist
   createdAt DateTime @default(now())
-  thread    Thread   @relation(fields: [threadId], references: [id])
 }
